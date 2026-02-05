@@ -145,7 +145,7 @@ SGLANG_RUNTIME_IMAGE_TAG_CU13="v0.5.8-cu130-runtime"
 
 # ROCm configuration for VLLM_ROCM framework
 VLLM_ROCM_BASE_IMAGE="rocm/pytorch"
-VLLM_ROCM_BASE_IMAGE_TAG="rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.7.0"
+VLLM_ROCM_BASE_IMAGE_TAG="rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1"
 ROCM_VERSION="7.2"
 
 PYTHON_VERSION="3.12"
