@@ -125,6 +125,18 @@ Additional output with --thorough-check:
 │        ├─ nvidia-cudnn-cu12==9.10.2.21
 │        ├─ torch==2.9.0+cu129
 │        └─ ... (more packages)
+
+Example output for AMD GPU:
+├─ ✅ AMD GPU: AMD Instinct MI300X, Power=285.00 W, Memory=1024/196608 MiB
+│  ├─ ROCm version: 6.3.0
+│  ├─ HIP version: 6.3.41133
+│  └─ ROCm Information (with --thorough)
+│     ├─ rocm-smi: ROCm System Management Interface v6.3.0
+│     ├─ hipcc: HIP version: 6.3.41133
+│     ├─ ROCM_PATH: /opt/rocm
+│     ├─ HIP_PATH: /opt/rocm/hip
+│     └─ PyTorch ROCm: torch=2.5.0+rocm6.3, rocm=6.3
+
 ├─ Ulimits
 │  ├─ Max open files: 1048576
 │  ├─ Max processes: 257698
@@ -463,7 +475,7 @@ class SystemInfo(NodeInfo):
         # Add GPU info (always show, even if not found) unless --no-gpu-check or --no-framework-check
         # (GPU is primarily for framework usage, so skip if frameworks are skipped)
         if not self.no_gpu_check and not self.no_framework_check:
-            gpu_info = GPUInfo(thorough_check=self.thorough_check)
+            gpu_info = GpuInfo(thorough_check=self.thorough_check)
             self.add_child(gpu_info)
 
         # Add Framework info (vllm, sglang, tensorrt_llm)
@@ -789,7 +801,7 @@ class OSInfo(NodeInfo):
             self.add_metadata("Cores", str(cores))
 
 
-class GPUInfo(NodeInfo):
+class NvidiaGpuInfo(NodeInfo):
     """NVIDIA GPU information.
 
     Displays GPU model, driver version, power/memory stats, and CUDA versions.
@@ -1183,6 +1195,356 @@ class GPUInfo(NodeInfo):
             node.desc = "no CUDA/NVIDIA information detected"
 
         return node
+
+
+class AmdGpuInfo(NodeInfo):
+    """AMD ROCm GPU information.
+
+    Displays GPU model, ROCm version, power/memory stats.
+    In thorough mode (--thorough-check), also collects detailed ROCm
+    environment information (rocm-smi, env vars, packages).
+    """
+
+    def __init__(self, thorough_check: bool = False):
+        self.thorough_check = thorough_check
+        # Find rocm-smi executable (check multiple paths)
+        rocm_smi = shutil.which("rocm-smi")
+        if not rocm_smi:
+            # Check common paths if `which` fails
+            for candidate in [
+                "/opt/rocm/bin/rocm-smi",
+                "/usr/bin/rocm-smi",
+                "/usr/local/bin/rocm-smi",
+            ]:
+                if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                    rocm_smi = candidate
+                    break
+
+        if not rocm_smi:
+            super().__init__(
+                label="AMD GPU", desc="rocm-smi not found", status=NodeStatus.ERROR
+            )
+            return
+
+        try:
+            # Get GPU list using rocm-smi
+            result = subprocess.run(
+                [rocm_smi, "--showproductname"], 
+                capture_output=True, 
+                text=True, 
+                timeout=10
+            )
+
+            if result.returncode != 0:
+                error_msg = "rocm-smi failed"
+                for output in [result.stderr, result.stdout]:
+                    if output and output.strip():
+                        error_lines = output.strip().splitlines()
+                        if error_lines:
+                            error_msg = error_lines[0].strip()
+                            break
+
+                super().__init__(
+                    label="AMD GPU", desc=error_msg, status=NodeStatus.ERROR
+                )
+                return
+
+            # Parse GPU names from rocm-smi output
+            gpu_names = []
+            lines = result.stdout.strip().splitlines()
+            for line in lines:
+                # rocm-smi output format: "GPU[0] : Card series: AMD Instinct MI300X"
+                if "card series" in line.lower() or "instinct" in line.lower() or "radeon" in line.lower():
+                    # Extract GPU name
+                    if ":" in line:
+                        gpu_name = line.split(":")[-1].strip()
+                        if gpu_name:
+                            gpu_names.append(gpu_name)
+
+            # Check for zero GPUs
+            if not gpu_names:
+                rocm_version = self._get_rocm_version(rocm_smi)
+                version_str = f", ROCm {rocm_version}" if rocm_version else ""
+                super().__init__(
+                    label="AMD GPU",
+                    desc=f"not detected{version_str}",
+                    status=NodeStatus.ERROR,
+                )
+                return
+
+            # Get ROCm version
+            rocm_version = self._get_rocm_version(rocm_smi)
+
+            # Handle single vs multiple GPUs
+            if len(gpu_names) == 1:
+                value = gpu_names[0]
+                super().__init__(label="AMD GPU", desc=value, status=NodeStatus.OK)
+                self._add_power_memory_info(rocm_smi, 0)
+            else:
+                value = f"{len(gpu_names)} GPUs"
+                super().__init__(label="AMD GPU", desc=value, status=NodeStatus.OK)
+
+                for i, name in enumerate(gpu_names):
+                    gpu_child = NodeInfo(
+                        label=f"GPU {i}", desc=name, status=NodeStatus.OK
+                    )
+                    power_mem = self._get_power_memory_string(rocm_smi, i)
+                    if power_mem:
+                        gpu_child.add_metadata("Stats", power_mem)
+                    self.add_child(gpu_child)
+
+            # Add ROCm version info
+            self._add_rocm_version_children(rocm_version)
+
+            # Add ROCm info in thorough mode
+            if self.thorough_check:
+                rocm_info = self._collect_rocm_info()
+                self.add_child(rocm_info)
+
+        except Exception:
+            super().__init__(
+                label="AMD GPU", desc="detection failed", status=NodeStatus.ERROR
+            )
+
+    def _get_rocm_version(self, rocm_smi: str) -> Optional[str]:
+        """Get ROCm version."""
+        try:
+            result = subprocess.run(
+                [rocm_smi, "--showversion"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                # Parse version from output
+                import re
+                for line in result.stdout.splitlines():
+                    if "rocm" in line.lower() or "version" in line.lower():
+                        match = re.search(r'(\d+\.\d+(?:\.\d+)?)', line)
+                        if match:
+                            return match.group(1)
+            
+            # Alternative: check /opt/rocm/.info/version
+            version_file = "/opt/rocm/.info/version"
+            if os.path.exists(version_file):
+                with open(version_file, 'r') as f:
+                    return f.read().strip()
+        except Exception:
+            pass
+        return None
+
+    def _add_rocm_version_children(self, rocm_version: Optional[str]):
+        """Add child nodes showing ROCm version."""
+        if rocm_version:
+            version_node = NodeInfo(
+                label="ROCm version",
+                desc=rocm_version,
+                status=NodeStatus.INFO,
+            )
+            self.add_child(version_node)
+
+        # Check for HIP version
+        try:
+            result = subprocess.run(
+                ["hipcc", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                import re
+                match = re.search(r'HIP version:\s*([0-9.]+)', result.stdout, re.IGNORECASE)
+                if match:
+                    hip_node = NodeInfo(
+                        label="HIP version",
+                        desc=match.group(1),
+                        status=NodeStatus.INFO,
+                    )
+                    self.add_child(hip_node)
+        except Exception:
+            pass
+
+    def _add_power_memory_info(self, rocm_smi: str, gpu_index: int = 0):
+        """Add power and memory metadata for a specific GPU."""
+        power_mem = self._get_power_memory_string(rocm_smi, gpu_index)
+        if power_mem:
+            if "; " in power_mem:
+                parts = power_mem.split("; ")
+                for part in parts:
+                    if part.startswith("Power:"):
+                        self.add_metadata("Power", part.replace("Power: ", ""))
+                    elif part.startswith("Memory:"):
+                        self.add_metadata("Memory", part.replace("Memory: ", ""))
+
+    def _get_power_memory_string(self, rocm_smi: str, gpu_index: int = 0) -> Optional[str]:
+        """Get power draw and memory usage string for a specific GPU."""
+        try:
+            parts = []
+            
+            # Get power usage
+            result = subprocess.run(
+                [rocm_smi, "-d", str(gpu_index), "--showpower"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                import re
+                for line in result.stdout.splitlines():
+                    if "power" in line.lower():
+                        match = re.search(r'(\d+(?:\.\d+)?)\s*W', line)
+                        if match:
+                            parts.append(f"Power: {match.group(1)} W")
+                            break
+
+            # Get memory usage
+            result = subprocess.run(
+                [rocm_smi, "-d", str(gpu_index), "--showmeminfo", "vram"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                import re
+                used_mem = None
+                total_mem = None
+                for line in result.stdout.splitlines():
+                    line_lower = line.lower()
+                    if "used" in line_lower:
+                        match = re.search(r'(\d+)', line)
+                        if match:
+                            used_mem = int(match.group(1)) // (1024 * 1024)  # Convert to MiB
+                    elif "total" in line_lower:
+                        match = re.search(r'(\d+)', line)
+                        if match:
+                            total_mem = int(match.group(1)) // (1024 * 1024)  # Convert to MiB
+                
+                if used_mem is not None and total_mem is not None:
+                    parts.append(f"Memory: {used_mem}/{total_mem} MiB")
+
+            return "; ".join(parts) if parts else None
+        except Exception:
+            return None
+
+    def _collect_rocm_info(self) -> NodeInfo:
+        """Collect and display ROCm environment and package information."""
+        def sh(cmd: str) -> str:
+            try:
+                p = subprocess.run(
+                    ["bash", "-c", f"{cmd} 2>/dev/null"],
+                    stdout=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                return (p.stdout or "").strip()
+            except Exception:
+                return ""
+
+        signals = [
+            ("rocm-smi", "rocm-smi --showversion 2>/dev/null | head -5"),
+            ("hipcc", "hipcc --version 2>/dev/null | head -3"),
+            ("ROCM_PATH", "echo $ROCM_PATH"),
+            ("HIP_PATH", "echo $HIP_PATH"),
+            ("ROCm packages", "dpkg -l 2>/dev/null | grep -i rocm | head -10 || rpm -qa 2>/dev/null | grep -i rocm | head -10"),
+            ("PyTorch ROCm", "python -c 'import torch; print(f\"torch={torch.__version__}, rocm={torch.version.hip}\")' 2>/dev/null"),
+        ]
+
+        node = NodeInfo(
+            label="ROCm Information",
+            desc="",
+            status=NodeStatus.INFO,
+        )
+
+        has_any_output = False
+        for label, cmd in signals:
+            out = sh(cmd)
+            lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+            if not lines:
+                continue
+
+            has_any_output = True
+
+            if len(lines) == 1:
+                signal_node = NodeInfo(label=label, desc=lines[0], status=NodeStatus.INFO)
+            else:
+                signal_node = NodeInfo(label=label, desc=f"{len(lines)} lines", status=NodeStatus.INFO)
+                for ln in lines[:5]:  # Limit to first 5 lines
+                    signal_node.add_child(NodeInfo(label="", desc=ln, status=NodeStatus.INFO))
+            
+            node.add_child(signal_node)
+
+        if not has_any_output:
+            node.desc = "no ROCm signals detected"
+
+        return node
+
+
+class GpuInfo(NodeInfo):
+    """Unified GPU information - detects NVIDIA or AMD GPUs.
+    
+    Automatically detects the GPU vendor and delegates to the appropriate
+    implementation (NvidiaGpuInfo or AmdGpuInfo).
+    """
+
+    def __init__(self, thorough_check: bool = False):
+        self.thorough_check = thorough_check
+        
+        # Try to detect NVIDIA GPUs first
+        nvidia_smi = shutil.which("nvidia-smi")
+        if nvidia_smi:
+            try:
+                result = subprocess.run(
+                    [nvidia_smi, "-L"], capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    # NVIDIA GPU detected - use NvidiaGpuInfo
+                    nvidia_info = NvidiaGpuInfo(thorough_check)
+                    super().__init__(
+                        label=nvidia_info.label,
+                        desc=nvidia_info.desc,
+                        status=nvidia_info.status,
+                    )
+                    self.children = nvidia_info.children
+                    self.metadata = nvidia_info.metadata
+                    return
+            except Exception:
+                pass
+
+        # Try to detect AMD GPUs
+        rocm_smi = shutil.which("rocm-smi")
+        if not rocm_smi:
+            for candidate in ["/opt/rocm/bin/rocm-smi", "/usr/bin/rocm-smi"]:
+                if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                    rocm_smi = candidate
+                    break
+        
+        if rocm_smi:
+            try:
+                result = subprocess.run(
+                    [rocm_smi, "--showproductname"], capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    # AMD GPU detected - use AmdGpuInfo
+                    amd_info = AmdGpuInfo(thorough_check)
+                    super().__init__(
+                        label=amd_info.label,
+                        desc=amd_info.desc,
+                        status=amd_info.status,
+                    )
+                    self.children = amd_info.children
+                    self.metadata = amd_info.metadata
+                    return
+            except Exception:
+                pass
+
+        # No GPU detected
+        super().__init__(
+            label="GPU",
+            desc="No NVIDIA or AMD GPU detected",
+            status=NodeStatus.ERROR,
+        )
 
 
 class FilePermissionsInfo(NodeInfo):
