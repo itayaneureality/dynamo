@@ -64,7 +64,7 @@ PYTHON_PACKAGE_VERSION=${current_tag:-$latest_tag.dev+$commit_id}
 # dependencies are specified in the /container/deps folder and
 # installed within framework specific sections of the Dockerfile.
 
-declare -A FRAMEWORKS=(["VLLM"]=1 ["TRTLLM"]=2 ["NONE"]=3 ["SGLANG"]=4)
+declare -A FRAMEWORKS=(["VLLM"]=1 ["TRTLLM"]=2 ["NONE"]=3 ["SGLANG"]=4 ["VLLM_ROCM"]=5)
 
 DEFAULT_FRAMEWORK=VLLM
 
@@ -142,6 +142,11 @@ SGLANG_BASE_IMAGE_TAG_CU13="25.11-cuda13.0-devel-ubuntu24.04"
 SGLANG_CUDA_VERSION="12.9.1"
 SGLANG_CUDA_VERSION_CU13="13.0.1"
 SGLANG_RUNTIME_IMAGE_TAG_CU13="v0.5.8-cu130-runtime"
+
+# ROCm configuration for VLLM_ROCM framework
+VLLM_ROCM_BASE_IMAGE="rocm/pytorch"
+VLLM_ROCM_BASE_IMAGE_TAG="rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1"
+ROCM_VERSION="7.2"
 
 PYTHON_VERSION="3.12"
 
@@ -403,6 +408,9 @@ get_options() {
         --no-tag-latest)
             NO_TAG_LATEST=true
             ;;
+        --rocm)
+            USE_ROCM=true
+            ;;
          -?*)
             error 'ERROR: Unknown option: ' "$1"
             ;;
@@ -425,6 +433,16 @@ get_options() {
 
     if [ -z "$FRAMEWORK" ]; then
         FRAMEWORK=$DEFAULT_FRAMEWORK
+    fi
+
+    # Handle ROCm flag - convert VLLM to VLLM_ROCM
+    if [[ "${USE_ROCM:-false}" == "true" ]]; then
+        if [[ "$FRAMEWORK" == "VLLM" ]]; then
+            FRAMEWORK="VLLM_ROCM"
+            echo "INFO: Using ROCm framework variant: VLLM_ROCM"
+        else
+            error "ERROR: --rocm flag is only supported with VLLM framework"
+        fi
     fi
 
     if [ -n "$FRAMEWORK" ]; then
@@ -473,8 +491,11 @@ get_options() {
 
     fi
 
+    # Convert VLLM_ROCM to vllm-rocm for tags (compute once and reuse)
+    FRAMEWORK_TAG=$(echo "${FRAMEWORK,,}" | sed 's/_/-/g')
+
     if [ -z "$TAG" ]; then
-        TAG="--tag dynamo:${VERSION}-${FRAMEWORK,,}"
+        TAG="--tag dynamo:${VERSION}-${FRAMEWORK_TAG}"
         if [ -n "${TARGET}" ] && [ "${TARGET}" != "local-dev" ]; then
             TAG="${TAG}-${TARGET}"
         fi
@@ -560,6 +581,7 @@ show_help() {
     echo "  [--vllm-max-jobs number of parallel jobs for compilation (only used by vLLM framework)]"
     echo "  [--efa-version AWS EFA installer version (default: 1.45.1)]"
     echo "  [--no-tag-latest do not add latest-{framework} tag to built image]"
+    echo "  [--rocm build vLLM with AMD ROCm support instead of CUDA (only with --framework VLLM)]"
     echo ""
     echo "  Note: When using --use-sccache, AWS credentials must be set:"
     echo "        export AWS_ACCESS_KEY_ID=your_access_key"
@@ -592,6 +614,8 @@ BUILD_ARGS+=" --build-arg DYNAMO_COMMIT_SHA=$DYNAMO_COMMIT_SHA "
 # Update DOCKERFILE if framework is VLLM
 if [[ $FRAMEWORK == "VLLM" ]]; then
     DOCKERFILE=${SOURCE_DIR}/Dockerfile.vllm
+elif [[ $FRAMEWORK == "VLLM_ROCM" ]]; then
+    DOCKERFILE=${SOURCE_DIR}/Dockerfile.vllm.rocm
 elif [[ $FRAMEWORK == "TRTLLM" ]]; then
     DOCKERFILE=${SOURCE_DIR}/Dockerfile.trtllm
 elif [[ $FRAMEWORK == "NONE" ]]; then
@@ -888,12 +912,12 @@ fi
 
 # ENABLE_KVBM: Used in base Dockerfile for block-manager feature.
 #              Declared but not currently used in Dockerfile.{vllm,trtllm}.
-# Force KVBM to be enabled for VLLM and TRTLLM frameworks
+# Force KVBM to be enabled for VLLM and TRTLLM frameworks (but not ROCm)
 if [[ $FRAMEWORK == "VLLM" ]] || [[ $FRAMEWORK == "TRTLLM" ]]; then
     echo "Forcing enable_kvbm to true in ${FRAMEWORK} image build"
     ENABLE_KVBM=true
 fi
-# For other frameworks, ENABLE_KVBM defaults to false unless --enable-kvbm flag was provided
+# For other frameworks (including VLLM_ROCM), ENABLE_KVBM defaults to false unless --enable-kvbm flag was provided
 
 if [[ ${ENABLE_KVBM} == "true" ]]; then
     echo "Enabling KVBM in the dynamo image"
@@ -902,12 +926,12 @@ fi
 
 # ENABLE_GPU_MEMORY_SERVICE: Used in Dockerfiles for gpu_memory_service wheel.
 #                            Declared but not currently used in Dockerfile.trtllm.
-# Force GPU Memory Service to be enabled for VLLM and SGLANG frameworks
+# Force GPU Memory Service to be enabled for VLLM and SGLANG frameworks (but not ROCm)
 if [[ $FRAMEWORK == "VLLM" ]] || [[ $FRAMEWORK == "SGLANG" ]]; then
     echo "Forcing enable_gpu_memory_service to true in ${FRAMEWORK} image build"
     ENABLE_GPU_MEMORY_SERVICE=true
 fi
-# For other frameworks, ENABLE_GPU_MEMORY_SERVICE defaults to false unless --enable-gpu-memory-service flag was provided
+# For other frameworks (including VLLM_ROCM), ENABLE_GPU_MEMORY_SERVICE defaults to false unless --enable-gpu-memory-service flag was provided
 
 if [[ ${ENABLE_GPU_MEMORY_SERVICE} == "true" ]]; then
     echo "Enabling GPU Memory Service in the dynamo image"
@@ -917,6 +941,7 @@ fi
 # ENABLE_MEDIA_NIXL: Enable media processing with NIXL support
 # Used in base Dockerfile for maturin build feature flag.
 # Can be explicitly overridden with --enable-media-nixl flag
+# Note: Disabled by default for ROCm due to CUDA-specific dependencies (gdrcopy)
 if [ -z "${ENABLE_MEDIA_NIXL}" ]; then
     if [[ $FRAMEWORK == "VLLM" ]] || [[ $FRAMEWORK == "TRTLLM" ]] || [[ $FRAMEWORK == "SGLANG" ]]; then
         ENABLE_MEDIA_NIXL=true
@@ -957,6 +982,11 @@ fi
 if [[ $FRAMEWORK == "SGLANG" ]]; then
     echo "Customizing Python, CUDA, and framework images for sglang images"
     BUILD_ARGS+=" --build-arg CUDA_VERSION=${SGLANG_CUDA_VERSION}"
+fi
+
+if [[ $FRAMEWORK == "VLLM_ROCM" ]]; then
+    echo "Customizing Python and ROCm for vllm-rocm images"
+    BUILD_ARGS+=" --build-arg ROCM_VERSION=${ROCM_VERSION}"
 fi
 
 BUILD_ARGS+=" --build-arg PYTHON_VERSION=${PYTHON_VERSION}"
@@ -1032,11 +1062,11 @@ fi
 LATEST_TAG=""
 if [ -z "${NO_TAG_LATEST}" ]; then
     if [[ -z "${TARGET:-}" || "${TARGET}" == "dev" ]]; then
-        LATEST_TAG="--tag dynamo:latest-${FRAMEWORK,,}"
+        LATEST_TAG="--tag dynamo:latest-${FRAMEWORK_TAG}"
     elif [[ "${TARGET}" == "local-dev" ]]; then
-        LATEST_TAG="--tag dynamo:latest-${FRAMEWORK,,}-local-dev"
+        LATEST_TAG="--tag dynamo:latest-${FRAMEWORK_TAG}-local-dev"
     else
-        LATEST_TAG="--tag dynamo:latest-${FRAMEWORK,,}"
+        LATEST_TAG="--tag dynamo:latest-${FRAMEWORK_TAG}"
         if [ -n "${TARGET}" ] && [ "${TARGET}" != "local-dev" ]; then
             LATEST_TAG="${LATEST_TAG}-${TARGET}"
         fi
