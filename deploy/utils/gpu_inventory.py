@@ -45,16 +45,23 @@ LABEL_GPU_PRODUCT = f"{NVIDIA_PREFIX}gpu.product"
 LABEL_GPU_MEMORY = f"{NVIDIA_PREFIX}gpu.memory"  # MiB per GPU
 LABEL_MIG_CAPABLE = f"{NVIDIA_PREFIX}mig.capable"
 
+# AMD ROCm device plugin labels
+AMD_PREFIX = "amd.com/"
+LABEL_AMD_GPU_COUNT = f"{AMD_PREFIX}gpu.count"
+LABEL_AMD_GPU_PRODUCT = f"{AMD_PREFIX}gpu.product"
+LABEL_AMD_GPU_MEMORY = f"{AMD_PREFIX}gpu.memory"
+
 
 @dataclass
 class NodeGpuInventory:
     node_name: str
+    gpu_vendor: Optional[str]  # "nvidia", "amd", or None
     gpu_count: Optional[int]
     gpu_product: Optional[str]
     gpu_memory_mib: Optional[int]
-    mig_capable: Optional[bool]
+    mig_capable: Optional[bool]  # Only applicable for NVIDIA
     allocatable_gpu: Optional[int]
-    mig_resources: Dict[str, str]
+    mig_resources: Dict[str, str]  # Only applicable for NVIDIA
 
     def to_dict(self) -> Dict[str, Union[str, int, bool, Dict[str, str], None]]:
         return asdict(self)
@@ -94,30 +101,55 @@ def _extract_inventory(node_obj: Dict) -> NodeGpuInventory:
     labels = meta.get("labels", {}) or {}
 
     node_name = meta.get("name", "<unknown>")
-    gpu_product = labels.get(LABEL_GPU_PRODUCT)
-    gpu_memory_mib = _parse_int(labels.get(LABEL_GPU_MEMORY))
-    mig_capable = _bool_from_str(labels.get(LABEL_MIG_CAPABLE))
 
-    # Prefer GFD-reported GPU count if present; otherwise use allocatable nvidia.com/gpu
-    gpu_count = _parse_int(labels.get(LABEL_GPU_COUNT))
+    # Detect GPU vendor by checking allocatable resources
+    gpu_vendor = None
+    gpu_count = None
+    gpu_product = None
+    gpu_memory_mib = None
+    mig_capable = None
+    alloc_gpu = None
+    mig_resources: Dict[str, str] = {}
 
     alloc = status.get("allocatable", {}) or {}
-    alloc_gpu = _parse_int(alloc.get(f"{NVIDIA_PREFIX}gpu"))
 
-    if gpu_count is None:
-        gpu_count = alloc_gpu
+    # Check for NVIDIA GPUs first
+    nvidia_gpu = _parse_int(alloc.get(f"{NVIDIA_PREFIX}gpu"))
+    if nvidia_gpu and nvidia_gpu > 0:
+        gpu_vendor = "nvidia"
+        gpu_product = labels.get(LABEL_GPU_PRODUCT)
+        gpu_memory_mib = _parse_int(labels.get(LABEL_GPU_MEMORY))
+        mig_capable = _bool_from_str(labels.get(LABEL_MIG_CAPABLE))
+        gpu_count = _parse_int(labels.get(LABEL_GPU_COUNT))
+        alloc_gpu = nvidia_gpu
+        if gpu_count is None:
+            gpu_count = alloc_gpu
+        # Collect MIG resources
+        mig_resources = {
+            k: str(v)
+            for k, v in alloc.items()
+            if isinstance(k, str)
+            and k.startswith(f"{NVIDIA_PREFIX}mig-")
+            and _parse_int(str(v))
+        }
 
-    # Collect MIG resource keys and counts if present
-    mig_resources: Dict[str, str] = {
-        k: str(v)
-        for k, v in alloc.items()
-        if isinstance(k, str)
-        and k.startswith(f"{NVIDIA_PREFIX}mig-")
-        and _parse_int(str(v))
-    }
+    # Check for AMD GPUs
+    amd_gpu = _parse_int(alloc.get(f"{AMD_PREFIX}gpu"))
+    if amd_gpu and amd_gpu > 0 and gpu_vendor is None:
+        gpu_vendor = "amd"
+        gpu_product = labels.get(LABEL_AMD_GPU_PRODUCT)
+        gpu_memory_mib = _parse_int(labels.get(LABEL_AMD_GPU_MEMORY))
+        gpu_count = _parse_int(labels.get(LABEL_AMD_GPU_COUNT))
+        alloc_gpu = amd_gpu
+        if gpu_count is None:
+            gpu_count = alloc_gpu
+        # AMD doesn't have MIG
+        mig_capable = False
+        mig_resources = {}
 
     return NodeGpuInventory(
         node_name=node_name,
+        gpu_vendor=gpu_vendor,
         gpu_count=gpu_count,
         gpu_product=gpu_product,
         gpu_memory_mib=gpu_memory_mib,
@@ -196,24 +228,28 @@ def _format_gib(mib: Optional[int]) -> str:
 
 
 def print_table(rows: List[NodeGpuInventory], show_mig: bool = False) -> None:
-    headers = ["NODE", "GPUS", "MODEL", "VRAM/GPU", "MIG"]
+    headers = ["NODE", "VENDOR", "GPUS", "MODEL", "VRAM/GPU", "MIG"]
     table: List[List[str]] = []
     for r in rows:
         mig_str = ""
-        if r.mig_capable is True:
-            if r.mig_resources:
-                mig_str = ",".join(
-                    f"{k.split('/')[-1]}={v}"
-                    for k, v in sorted(r.mig_resources.items())
-                )
-            else:
-                mig_str = "capable"
-        elif r.mig_capable is False:
-            mig_str = "no"
+        if r.gpu_vendor == "nvidia":
+            if r.mig_capable is True:
+                if r.mig_resources:
+                    mig_str = ",".join(
+                        f"{k.split('/')[-1]}={v}"
+                        for k, v in sorted(r.mig_resources.items())
+                    )
+                else:
+                    mig_str = "capable"
+            elif r.mig_capable is False:
+                mig_str = "no"
+        else:
+            mig_str = "n/a"  # AMD doesn't have MIG
 
         table.append(
             [
                 r.node_name,
+                r.gpu_vendor or "",
                 "" if r.gpu_count is None else str(r.gpu_count),
                 r.gpu_product or "",
                 _format_gib(r.gpu_memory_mib),
@@ -252,15 +288,15 @@ def aggregate_valued_rows(
     if not valued:
         return None, 0
 
-    # Group by (product, vram_mib)
+    # Group by (vendor, product, vram_mib)
     from collections import defaultdict
 
     groups: Dict[
-        Tuple[Optional[str], Optional[int]],
+        Tuple[Optional[str], Optional[str], Optional[int]],
         Dict[str, object],
     ] = defaultdict(lambda: {"max_gpu": 0, "rows": []})
     for r in valued:
-        key = (r.gpu_product, r.gpu_memory_mib)
+        key = (r.gpu_vendor, r.gpu_product, r.gpu_memory_mib)
         meta = groups[key]
         meta["rows"].append(r)  # type: ignore[attr-defined, index]
         # Use known gpu_count if available for ranking
@@ -269,21 +305,22 @@ def aggregate_valued_rows(
 
     def sort_key(
         item: Tuple[
-            Tuple[Optional[str], Optional[int]],
+            Tuple[Optional[str], Optional[str], Optional[int]],
             Dict[str, object],
-        ]
+        ],
     ):
-        (prod, mem_mib), meta = item
+        (vendor, prod, mem_mib), meta = item
         max_gpu = int(meta["max_gpu"])  # type: ignore[arg-type, call-overload, index]
         mem_val = mem_mib if mem_mib is not None else -1
         return (max_gpu, mem_val)
 
     selected_key, selected_meta = sorted(groups.items(), key=sort_key, reverse=True)[0]
-    sel_prod, sel_mem_mib = selected_key
+    sel_vendor, sel_prod, sel_mem_mib = selected_key
     sel_gpu = int(selected_meta["max_gpu"])  # type: ignore[arg-type, call-overload, index]
 
     selected = NodeGpuInventory(
         node_name="<aggregate>",
+        gpu_vendor=sel_vendor,
         gpu_count=sel_gpu if sel_gpu > 0 else None,
         gpu_product=sel_prod,
         gpu_memory_mib=sel_mem_mib,
@@ -384,19 +421,135 @@ def enrich_with_smi(
                 break
 
 
+def enrich_with_rocm_smi(
+    rows: List[NodeGpuInventory],
+    namespace: Optional[str] = None,
+    timeout_seconds: int = 180,
+) -> None:
+    """For AMD GPU nodes missing product/memory labels, schedule a short-lived pod
+    that runs rocm-smi to capture model and memory.
+
+    Requires permissions: create/get/delete pods and get pods/log in the namespace.
+    """
+    ns = namespace or _get_current_namespace()
+    try:
+        config.load_incluster_config()
+    except Exception:
+        pass
+
+    v1 = client.CoreV1Api()
+
+    for inv in rows:
+        # Only process AMD GPU nodes missing metadata
+        if inv.gpu_vendor != "amd":
+            continue
+        if not inv.gpu_count or (
+            inv.gpu_product is not None and inv.gpu_memory_mib is not None
+        ):
+            continue
+
+        pod_name = f"gpu-inv-rocm-{uuid.uuid4().hex[:6]}"
+        container = client.V1Container(
+            name="rocm-smi",
+            image="rocm/rocm-terminal:latest",
+            command=["bash", "-lc"],
+            args=[
+                # rocm-smi --showproductname shows GPU model
+                # rocm-smi --showmeminfo vram shows VRAM
+                "rocm-smi --showproductname --csv | tail -1 && rocm-smi --showmeminfo vram --csv | grep -v 'device\\|GPU' | head -1"
+            ],
+            resources=client.V1ResourceRequirements(
+                limits={"amd.com/gpu": "1", "cpu": "100m", "memory": "128Mi"},
+                requests={"amd.com/gpu": "1", "cpu": "50m", "memory": "64Mi"},
+            ),
+            security_context=client.V1SecurityContext(
+                capabilities=client.V1Capabilities(add=["SYS_PTRACE"])
+            ),
+        )
+
+        pod = client.V1Pod(
+            api_version="v1",
+            kind="Pod",
+            metadata=client.V1ObjectMeta(name=pod_name, namespace=ns),
+            spec=client.V1PodSpec(
+                restart_policy="Never",
+                node_name=inv.node_name,
+                containers=[container],
+            ),
+        )
+
+        logs = ""
+        try:
+            v1.create_namespaced_pod(namespace=ns, body=pod)
+            start = time.time()
+            while time.time() - start < timeout_seconds:
+                p = v1.read_namespaced_pod(name=pod_name, namespace=ns)
+                phase = (p.status.phase or "").lower()
+                if phase in ("succeeded", "failed"):
+                    break
+                time.sleep(2)
+            try:
+                logs = v1.read_namespaced_pod_log(name=pod_name, namespace=ns)
+            except Exception:
+                logs = ""
+        finally:
+            try:
+                v1.delete_namespaced_pod(
+                    name=pod_name, namespace=ns, body=client.V1DeleteOptions()
+                )
+            except Exception:
+                pass
+
+        # Parse rocm-smi output
+        # Example output format varies, but typically:
+        # Card series: AMD Instinct MI300X
+        # VRAM Total: 196608 MB (or similar)
+        for line in logs.splitlines():
+            line = line.strip()
+            # Try to extract GPU model
+            if "instinct" in line.lower() or "radeon" in line.lower():
+                inv.gpu_product = inv.gpu_product or line.strip()
+            # Try to extract VRAM (in MB)
+            if "vram" in line.lower() or re.search(
+                r"\d+\s*(MB|MiB|GB|GiB)", line, re.I
+            ):
+                mem_match = re.search(r"(\d+)\s*(MB|MiB|GB|GiB)?", line, re.I)
+                if mem_match:
+                    mem_val = int(mem_match.group(1))
+                    unit = (mem_match.group(2) or "MB").upper()
+                    if "GB" in unit or "GIB" in unit:
+                        mem_val = mem_val * 1024
+                    inv.gpu_memory_mib = inv.gpu_memory_mib or mem_val
+
+
+def enrich_gpu_inventory(
+    rows: List[NodeGpuInventory],
+    namespace: Optional[str] = None,
+    timeout_seconds: int = 180,
+) -> None:
+    """Enrich GPU inventory for both NVIDIA and AMD GPUs."""
+    nvidia_rows = [r for r in rows if r.gpu_vendor == "nvidia"]
+    amd_rows = [r for r in rows if r.gpu_vendor == "amd"]
+
+    if nvidia_rows:
+        enrich_with_smi(nvidia_rows, namespace, timeout_seconds)
+    if amd_rows:
+        enrich_with_rocm_smi(amd_rows, namespace, timeout_seconds)
+
+
 def get_gpu_summary(
     prefer_client: bool = True, enrich_smi: bool = True
 ) -> Dict[str, object]:
     """Return an aggregate GPU summary for the cluster.
 
     Selection policy when multiple values exist: prefer higher GPUs per node,
-    then higher VRAM/GPU. Returns dict with keys: gpus_per_node, model, vram.
-    If model/VRAM unavailable anywhere, returns {"gpus_per_node": max_gpus, "model": "", "vram": 0}.
+    then higher VRAM/GPU. Returns dict with keys: gpus_per_node, model, vram, vendor.
+    If model/VRAM unavailable anywhere, returns {"gpus_per_node": max_gpus, "model": "", "vram": 0, "vendor": ""}.
     """
     # TODO: use proper tools (i.e., DCGM) to get GPU inventory
     rows, _ = collect_gpu_inventory(prefer_client=prefer_client)
     if enrich_smi:
-        enrich_with_smi(rows)
+        enrich_gpu_inventory(rows)
 
     agg, _distinct = aggregate_valued_rows(rows)
     if agg is None:
@@ -405,15 +558,17 @@ def get_gpu_summary(
         for r in rows:
             if r.gpu_count is not None:
                 max_gpus = max(max_gpus, int(r.gpu_count))
-        return {"gpus_per_node": max_gpus, "model": "", "vram": 0}
+        return {"gpus_per_node": max_gpus, "model": "", "vram": 0, "vendor": ""}
 
     gpus_val = int(agg.gpu_count) if agg.gpu_count is not None else 0
     model_val = agg.gpu_product or ""
     vram_val = int(agg.gpu_memory_mib) if agg.gpu_memory_mib is not None else 0
+    vendor_val = agg.gpu_vendor or ""
     return {
         "gpus_per_node": gpus_val,
         "model": model_val,
         "vram": vram_val,
+        "vendor": vendor_val,
     }
 
 
@@ -442,7 +597,7 @@ def main() -> None:
     parser.add_argument(
         "--enrich-smi",
         action="store_true",
-        help="Schedule short-lived pods per node to fetch model/VRAM via nvidia-smi",
+        help="Schedule short-lived pods per node to fetch model/VRAM via nvidia-smi (NVIDIA) or rocm-smi (AMD)",
     )
     parser.add_argument(
         "--aggregate",
@@ -456,7 +611,7 @@ def main() -> None:
     rows, source = collect_gpu_inventory(prefer_client=prefer_client)
 
     if args.enrich_smi:
-        enrich_with_smi(rows)
+        enrich_gpu_inventory(rows)
 
     if args.format == "json":
         payload = {
