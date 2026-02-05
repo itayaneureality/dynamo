@@ -491,9 +491,10 @@ get_options() {
 
     fi
 
+    # Convert VLLM_ROCM to vllm-rocm for tags (compute once and reuse)
+    FRAMEWORK_TAG=$(echo "${FRAMEWORK,,}" | sed 's/_/-/g')
+
     if [ -z "$TAG" ]; then
-        # Convert VLLM_ROCM to vllm-rocm for tag
-        FRAMEWORK_TAG=$(echo "${FRAMEWORK,,}" | sed 's/_/-/g')
         TAG="--tag dynamo:${VERSION}-${FRAMEWORK_TAG}"
         if [ -n "${TARGET}" ] && [ "${TARGET}" != "local-dev" ]; then
             TAG="${TAG}-${TARGET}"
@@ -1060,8 +1061,6 @@ fi
 
 LATEST_TAG=""
 if [ -z "${NO_TAG_LATEST}" ]; then
-    # Convert VLLM_ROCM to vllm-rocm for tag
-    FRAMEWORK_TAG=$(echo "${FRAMEWORK,,}" | sed 's/_/-/g')
     if [[ -z "${TARGET:-}" || "${TARGET}" == "dev" ]]; then
         LATEST_TAG="--tag dynamo:latest-${FRAMEWORK_TAG}"
     elif [[ "${TARGET}" == "local-dev" ]]; then
