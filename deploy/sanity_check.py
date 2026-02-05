@@ -1252,13 +1252,18 @@ class AmdGpuInfo(NodeInfo):
             # Parse GPU names from rocm-smi output
             gpu_names = []
             lines = result.stdout.strip().splitlines()
+            import re
             for line in lines:
                 # rocm-smi output format: "GPU[0] : Card series: AMD Instinct MI300X"
-                if "card series" in line.lower() or "instinct" in line.lower() or "radeon" in line.lower():
-                    # Extract GPU name
-                    if ":" in line:
-                        gpu_name = line.split(":")[-1].strip()
-                        if gpu_name:
+                # or "GPU[0]        : Card series:     AMD Radeon RX 7900 XTX"
+                # Match pattern: GPU[N] ... : ... : GPU_NAME or Card series: GPU_NAME
+                if "gpu[" in line.lower() and ("card series" in line.lower() or ":" in line):
+                    # Try to extract the GPU name after "Card series:" or after the last ":"
+                    parts = line.split(":")
+                    if len(parts) >= 2:
+                        # Get the last part which should be the GPU name
+                        gpu_name = parts[-1].strip()
+                        if gpu_name and gpu_name.lower() not in ["card series", "gpu"]:
                             gpu_names.append(gpu_name)
 
             # Check for zero GPUs
@@ -1410,14 +1415,36 @@ class AmdGpuInfo(NodeInfo):
                 total_mem = None
                 for line in result.stdout.splitlines():
                     line_lower = line.lower()
+                    # Try to extract memory values with units (e.g., "1024 MB", "1 GB", "512000000 B")
                     if "used" in line_lower:
-                        match = re.search(r'(\d+)', line)
+                        # Match number followed by optional unit (B, KB, MB, GB, etc.)
+                        match = re.search(r'(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|GiB|MiB|KiB)?', line, re.IGNORECASE)
                         if match:
-                            used_mem = int(match.group(1)) // (1024 * 1024)  # Convert to MiB
+                            value = float(match.group(1))
+                            unit = (match.group(2) or "B").upper()
+                            # Convert to MiB
+                            if unit in ["B", "BYTES"]:
+                                used_mem = int(value / (1024 * 1024))
+                            elif unit in ["KB", "KIB"]:
+                                used_mem = int(value / 1024)
+                            elif unit in ["MB", "MIB"]:
+                                used_mem = int(value)
+                            elif unit in ["GB", "GIB"]:
+                                used_mem = int(value * 1024)
                     elif "total" in line_lower:
-                        match = re.search(r'(\d+)', line)
+                        match = re.search(r'(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|GiB|MiB|KiB)?', line, re.IGNORECASE)
                         if match:
-                            total_mem = int(match.group(1)) // (1024 * 1024)  # Convert to MiB
+                            value = float(match.group(1))
+                            unit = (match.group(2) or "B").upper()
+                            # Convert to MiB
+                            if unit in ["B", "BYTES"]:
+                                total_mem = int(value / (1024 * 1024))
+                            elif unit in ["KB", "KIB"]:
+                                total_mem = int(value / 1024)
+                            elif unit in ["MB", "MIB"]:
+                                total_mem = int(value)
+                            elif unit in ["GB", "GIB"]:
+                                total_mem = int(value * 1024)
                 
                 if used_mem is not None and total_mem is not None:
                     parts.append(f"Memory: {used_mem}/{total_mem} MiB")
