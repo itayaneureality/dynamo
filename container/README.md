@@ -11,9 +11,10 @@ The NVIDIA Dynamo project uses containerized development and deployment to maint
 - **`run.sh`** - A container runtime manager that launches Docker containers with proper GPU access, volume mounts, and environment configurations. It supports different development workflows from root-based legacy setups to user-based development environments.
 
 - **Multiple Dockerfiles** - Framework-specific Dockerfiles that define the container images:
-  - `Dockerfile.vllm` - For vLLM inference backend
-  - `Dockerfile.trtllm` - For TensorRT-LLM inference backend
-  - `Dockerfile.sglang` - For SGLang inference backend
+  - `Dockerfile.vllm` - For vLLM inference backend (NVIDIA CUDA)
+  - `Dockerfile.vllm.rocm` - For vLLM inference backend (AMD ROCm)
+  - `Dockerfile.trtllm` - For TensorRT-LLM inference backend (NVIDIA CUDA only)
+  - `Dockerfile.sglang` - For SGLang inference backend (NVIDIA CUDA)
   - `Dockerfile` - Base/standalone configuration
   - `Dockerfile.epp` - For building the Endpoint Picker (EPP) image
 
@@ -145,10 +146,11 @@ The `build.sh` script is responsible for building Docker images for different AI
 
 **Key Features:**
 - **Framework Support**: vLLM (default when --framework not specified), TensorRT-LLM, SGLang, or NONE
+- **GPU Support**: NVIDIA CUDA (vLLM, TensorRT-LLM, SGLang) and AMD ROCm (vLLM only with `--rocm` flag)
 - **Multi-stage Builds**: Build process with base images
 - **Development Targets**: Supports `dev`, `runtime`, and `local-dev` targets via `build.sh`.
 - **Build Caching**: Docker layer caching and sccache support
-- **GPU Optimization**: CUDA, EFA, and NIXL support
+- **GPU Optimization**: CUDA, ROCm, EFA, and NIXL support
 
 #### BuildKit cache mounts in Dockerfiles
 
@@ -258,7 +260,51 @@ Note: `uv` commands set `UV_CACHE_DIR` per `RUN` so `uv` always uses the same pa
 
 # Build with build arguments
 ./build.sh --build-arg CUSTOM_ARG=value
+
+# Build vLLM with AMD ROCm support (instead of CUDA)
+./build.sh --framework vllm --rocm
+
+# Build vLLM ROCm runtime image
+./build.sh --framework vllm --rocm --target runtime
 ```
+
+### Building with AMD ROCm Support
+
+Dynamo supports building vLLM containers for AMD GPUs using ROCm instead of CUDA. Use the `--rocm` flag with the `vllm` framework to build ROCm-enabled images.
+
+**ROCm Build Features:**
+- Uses AMD ROCm 7.2 base images (`rocm/pytorch`)
+- Installs vLLM with ROCm support
+- Configures RCCL (ROCm Collective Communications Library) for multi-GPU communication
+- Supports RDMA for high-performance multi-node inference
+- HIP API support (PyTorch handles CUDA→HIP translation transparently)
+
+**Differences from CUDA builds:**
+- No CUDA toolchain, TensorRT-LLM, or NVIDIA-specific dependencies (gdrcopy)
+- Uses HIP_VISIBLE_DEVICES instead of CUDA_VISIBLE_DEVICES
+- KVBM and GPU Memory Service disabled by default for ROCm (can be enabled with flags if needed)
+- NIXL media processing disabled by default (CUDA-specific dependencies)
+
+**Common ROCm Build Examples:**
+
+```bash
+# Build vLLM dev image with ROCm support
+./build.sh --framework vllm --rocm
+
+# Build vLLM runtime image with ROCm for production
+./build.sh --framework vllm --rocm --target runtime
+
+# Build local-dev image with ROCm for development
+./build.sh --framework vllm --rocm --target local-dev
+
+# Dry run to see the docker commands
+./build.sh --framework vllm --rocm --dry-run
+```
+
+The resulting images are tagged as `dynamo:*-vllm-rocm-*` to distinguish them from CUDA builds.
+
+**Note:** TensorRT-LLM and SGLang are not supported with ROCm builds. Use `--rocm` flag only with `--framework vllm`.
+
 
 ### Building the Frontend Image
 
