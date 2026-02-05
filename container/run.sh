@@ -42,6 +42,11 @@ ENVIRONMENT_VARIABLES=
 REMAINING_ARGS=
 INTERACTIVE=
 USE_NIXL_GDS=
+USE_ROCM=
+ROCM_DEVICE_STRING=
+ROCM_GROUP_STRING=
+ROCM_CAPS=
+ROCM_SECURITY=
 RUNTIME=nvidia
 WORKDIR=/workspace
 NETWORK=host
@@ -177,6 +182,9 @@ get_options() {
         --use-nixl-gds)
             USE_NIXL_GDS=TRUE
             ;;
+        --rocm)
+            USE_ROCM=TRUE
+            ;;
         --network)
             if [ "$2" ]; then
                 NETWORK=$2
@@ -231,16 +239,49 @@ get_options() {
     fi
 
     if [ -z "$IMAGE" ]; then
-        IMAGE="dynamo:latest-${FRAMEWORK,,}"
+        if [ -n "$USE_ROCM" ]; then
+            IMAGE="dynamo:latest-vllm-rocm"
+        else
+            IMAGE="dynamo:latest-${FRAMEWORK,,}"
+        fi
         if [ -n "${TARGET}" ]; then
             IMAGE="${IMAGE}-${TARGET}"
         fi
+    fi
+
+    # Check for mutual exclusivity of --rocm and --gpus
+    if [ -n "$USE_ROCM" ] && [[ "$GPUS" != "none" && "$GPUS" != "NONE" && "$GPUS" != "all" ]]; then
+        error "ERROR: --rocm and --gpus cannot be used together (except --gpus none)"
     fi
 
     if [[ ${GPUS^^} == "NONE" ]]; then
         GPU_STRING=""
     else
         GPU_STRING="--gpus ${GPUS}"
+    fi
+
+    # Configure ROCm device mounting if --rocm is set
+    if [ -n "$USE_ROCM" ]; then
+        # Clear NVIDIA GPU configuration
+        GPU_STRING=""
+        RUNTIME=""
+        
+        # Mount AMD GPU devices
+        ROCM_DEVICE_STRING="--device /dev/kfd --device /dev/dri"
+        
+        # Add video group for GPU access
+        ROCM_GROUP_STRING="--group-add video"
+        
+        # Required capability for ROCm
+        ROCM_CAPS="--cap-add=SYS_PTRACE"
+        
+        # Security options for AMD GPUs
+        ROCM_SECURITY="--security-opt seccomp=unconfined"
+        
+        # If RDMA devices exist, mount them
+        if [ -d "/dev/infiniband" ]; then
+            ROCM_DEVICE_STRING+=" --device /dev/infiniband"
+        fi
     fi
 
     if [[ ${NAME^^} == "" ]]; then
@@ -265,6 +306,12 @@ get_options() {
         fi
 
         ENVIRONMENT_VARIABLES+=" -e HF_TOKEN"
+    fi
+
+    # Add ROCm-specific environment variables
+    if [ -n "$USE_ROCM" ]; then
+        ENVIRONMENT_VARIABLES+=" -e HSA_ENABLE_SDMA=0"
+        ENVIRONMENT_VARIABLES+=" -e RCCL_SOCKET_IFNAME=^lo,docker0"
     fi
 
     if [[ ${HF_HOME^^} == "NONE" ]]; then
@@ -299,6 +346,12 @@ get_options() {
         RM_STRING=""
     else
         RM_STRING=" --rm "
+    fi
+
+    # Warn if both ROCm and NIXL GDS are specified
+    if [ -n "$USE_ROCM" ] && [ -n "$USE_NIXL_GDS" ]; then
+        echo "WARNING: --use-nixl-gds is not supported with ROCm. Ignoring."
+        USE_NIXL_GDS=""
     fi
 
     if [ -n "$USE_NIXL_GDS" ]; then
@@ -348,6 +401,9 @@ show_help() {
     echo "  [--dry-run print docker commands without running]"
     echo "  [--hf-home|--hf-cache directory to volume mount as the hf home, default is NONE unless mounting workspace]"
     echo "  [--gpus gpus to enable, default is 'all', 'none' disables gpu support]"
+    echo "  [--rocm run container with AMD ROCm GPU support (instead of NVIDIA)]"
+    echo "           When enabled, mounts /dev/kfd and /dev/dri instead of using --gpus"
+    echo "           Adds video group and required capabilities for ROCm"
     echo "  [--use-nixl-gds add volume mounts and capabilities needed for NVIDIA GPUDirect Storage]"
     echo "  [--network network mode for container, default is 'host']"
     echo "           Options: 'host' (default), 'bridge', 'none', 'container:name'"
@@ -385,6 +441,7 @@ fi
 
 ${RUN_PREFIX} docker run \
     ${GPU_STRING} \
+    ${ROCM_DEVICE_STRING} \
     ${INTERACTIVE} \
     ${RM_STRING} \
     --network "$NETWORK" \
@@ -398,6 +455,9 @@ ${RUN_PREFIX} docker run \
     ${PORT_MAPPINGS} \
     -w "$WORKDIR" \
     --cap-add CAP_SYS_PTRACE \
+    ${ROCM_CAPS} \
+    ${ROCM_SECURITY} \
+    ${ROCM_GROUP_STRING} \
     ${NIXL_GDS_CAPS} \
     --ipc host \
     ${PRIVILEGED_STRING} \
