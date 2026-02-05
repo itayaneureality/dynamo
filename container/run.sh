@@ -251,7 +251,7 @@ get_options() {
 
     # Check for mutual exclusivity of --rocm and --gpus
     if [ -n "$USE_ROCM" ] && [[ "$GPUS" != "none" && "$GPUS" != "NONE" && "$GPUS" != "all" ]]; then
-        error "ERROR: --rocm and --gpus cannot be used together (except --gpus none)"
+        error "ERROR: --rocm and --gpus cannot be used together (except --gpus none or --gpus all)"
     fi
 
     if [[ ${GPUS^^} == "NONE" ]]; then
